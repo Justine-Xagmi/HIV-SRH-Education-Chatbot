@@ -14,6 +14,12 @@ from app.db.repository import KnowledgeRepository
 from app.db.session import SessionLocal
 
 
+EXPECTED_SQLSTATE = "55000"
+EXPECTED_ERROR_MESSAGE = (
+    "Document versions are immutable; create a new version instead."
+)
+
+
 @pytest.fixture
 def db_session():
     if SessionLocal is None:
@@ -59,10 +65,44 @@ def create_test_version(session):
     return document, version
 
 
+def assert_immutability_error(error):
+    """Verify that PostgreSQL returned the expected immutability error."""
+    original_error = error.value.orig
+
+    # psycopg 3 exposes sqlstate; psycopg2 exposes pgcode.
+    actual_sqlstate = (
+        getattr(original_error, "sqlstate", None)
+        or getattr(original_error, "pgcode", None)
+    )
+
+    assert actual_sqlstate == EXPECTED_SQLSTATE, (
+        f"Expected PostgreSQL SQLSTATE {EXPECTED_SQLSTATE}, "
+        f"but received {actual_sqlstate!r}. "
+        f"Original error: {original_error}"
+    )
+
+    # PostgreSQL drivers expose the primary message through diag when
+    # available. Fall back to the original exception text.
+    diagnostic = getattr(original_error, "diag", None)
+    actual_message = (
+        getattr(diagnostic, "message_primary", None)
+        if diagnostic is not None
+        else None
+    )
+
+    if actual_message is None:
+        actual_message = str(original_error)
+
+    assert actual_message == EXPECTED_ERROR_MESSAGE, (
+        f"Expected immutability message {EXPECTED_ERROR_MESSAGE!r}, "
+        f"but received {actual_message!r}"
+    )
+
+
 def test_existing_document_version_cannot_be_updated(db_session):
     _, version = create_test_version(db_session)
 
-    with pytest.raises(DBAPIError):
+    with pytest.raises(DBAPIError) as error:
         with db_session.begin_nested():
             db_session.execute(
                 update(DocumentVersion)
@@ -70,17 +110,21 @@ def test_existing_document_version_cannot_be_updated(db_session):
                 .values(content="Modified test content")
             )
 
+    assert_immutability_error(error)
+
 
 def test_existing_document_version_cannot_be_deleted(db_session):
     _, version = create_test_version(db_session)
 
-    with pytest.raises(DBAPIError):
+    with pytest.raises(DBAPIError) as error:
         with db_session.begin_nested():
             db_session.execute(
                 delete(DocumentVersion).where(
                     DocumentVersion.id == version.id
                 )
             )
+
+    assert_immutability_error(error)
 
 
 def test_new_document_version_can_be_inserted(db_session):

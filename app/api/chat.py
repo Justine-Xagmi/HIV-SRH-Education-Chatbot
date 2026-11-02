@@ -1,13 +1,31 @@
 
-from fastapi import APIRouter
+from collections.abc import Generator
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.api.schemas import ChatRequest, ChatResponse
-from app.knowledge.store import knowledge_registry
+from app.db import session as db_session
+from app.knowledge.persistent_retrieval import (
+    PersistentKnowledgeRetriever,
+)
 
 router = APIRouter(
     prefix="/api/v1",
     tags=["Chat"],
 )
+
+
+def _service_unavailable() -> HTTPException:
+    """Create a generic error without exposing internal details."""
+    return HTTPException(
+        status_code=503,
+        detail=(
+            "The health information service is temporarily "
+            "unavailable. Please try again later."
+        ),
+    )
 
 
 def _fallback_response(language: str) -> ChatResponse:
@@ -43,43 +61,55 @@ def _fallback_response(language: str) -> ChatResponse:
     )
 
 
+def get_knowledge_retriever(
+) -> Generator[PersistentKnowledgeRetriever, None, None]:
+    """Provide a database-backed retriever and manage its session."""
+
+    if db_session.SessionLocal is None:
+        raise _service_unavailable()
+
+    db: Session | None = None
+
+    try:
+        db = db_session.SessionLocal()
+        yield PersistentKnowledgeRetriever(db)
+    except SQLAlchemyError as exc:
+        raise _service_unavailable() from exc
+    finally:
+        if db is not None:
+            db.close()
+
+
 @router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-    """Return matching content only from approved documents and sources."""
+def chat(
+    request: ChatRequest,
+    retriever: PersistentKnowledgeRetriever = Depends(
+        get_knowledge_retriever
+    ),
+) -> ChatResponse:
+    """Return information only from eligible, approved database documents."""
 
-    documents = knowledge_registry.retrieve(
-        query=request.message,
-        language=request.language,
-        limit=5,
-    )
-
-    # Defensive checks: only include documents whose source language
-    # also matches the requested language and whose review is approved.
-    approved_documents = [
-        document
-        for document in documents
-        if (
-            document.review_status == "approved"
-            and document.source.review_status == "approved"
-            and document.language == request.language
-            and document.source.language == request.language
+    try:
+        documents = retriever.retrieve(
+            query=request.message,
+            language=request.language,
+            limit=5,
         )
-    ]
+    except SQLAlchemyError as exc:
+        raise _service_unavailable() from exc
 
-    if not approved_documents:
+    if not documents:
         return _fallback_response(request.language)
 
-    answer = "\n\n".join(
-        document.content for document in approved_documents
-    )
+    answer = "\n\n".join(document.content for document in documents)
 
     sources = [
         {
-            "title": document.source.title,
-            "organization": document.source.organization,
-            "url": str(document.source.url),
+            "title": document.source_title,
+            "organization": document.source_organization or "",
+            "url": document.source_url,
         }
-        for document in approved_documents
+        for document in documents
     ]
 
     if request.language == "sw":

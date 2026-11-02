@@ -21,6 +21,15 @@ def make_document() -> KnowledgeDocument:
         publication_date=date(2025, 1, 1),
         last_verified_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
         permission_status="permitted",
+        permission_basis="Synthetic permission evidence for automated tests.",
+        permission_reference="TEST-PERMISSION-001",
+        permission_checked_at=datetime(
+            2026, 10, 1, tzinfo=timezone.utc
+        ),
+        permission_checked_by="test-permission-reviewer",
+        permission_notes=(
+            "Test fixture only; not evidence of real-world permission."
+        ),
     )
 
     return KnowledgeDocument(
@@ -233,7 +242,6 @@ def test_multiple_decisions_are_preserved_in_history():
     assert len(records) == 2
     assert records[0].decision == "changes_requested"
     assert records[1].decision == "approved"
-
 
 
 def test_source_permission_change_invalidates_approval():

@@ -1,8 +1,11 @@
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
+from sqlalchemy.exc import SQLAlchemyError
 from fastapi.testclient import TestClient
 
+from app.api.chat import get_knowledge_retriever
 from app.knowledge.models import HealthSource, KnowledgeDocument
 from app.knowledge.registry import KnowledgeRegistry
 from app.main import app
@@ -37,8 +40,17 @@ def make_document(
         ),
         version="test-1",
         publication_date=date(2025, 1, 1),
-        last_verified_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        last_verified_at=datetime(
+            2026, 10, 1, tzinfo=timezone.utc
+        ),
         permission_status="permitted",
+        permission_basis="Synthetic permission evidence for automated tests.",
+        permission_reference="TEST-PERMISSION-001",
+        permission_checked_at=datetime(
+            2026, 10, 1, tzinfo=timezone.utc
+        ),
+        permission_checked_by="test-permission-reviewer",
+        permission_notes="Test fixture only; not evidence of real-world permission.",
     )
 
     return KnowledgeDocument(
@@ -82,11 +94,41 @@ def add_approved_document(registry, document):
     )
 
 
+class RegistryTestRetriever:
+    """
+    Adapt the in-memory registry to the persistent retriever's result shape.
+
+    This adapter is only for API tests. Production requests use the
+    PersistentKnowledgeRetriever dependency.
+    """
+
+    def __init__(self, registry):
+        self.registry = registry
+
+    def retrieve(self, query, language, limit=5):
+        documents = self.registry.retrieve(
+            query=query,
+            language=language,
+            limit=limit,
+        )
+
+        return [
+            SimpleNamespace(
+                content=document.content,
+                source_title=document.source.title,
+                source_organization=document.source.organization,
+                source_url=str(document.source.url),
+            )
+            for document in documents
+        ]
+
+
 def use_registry(monkeypatch, registry):
-    """Give each test its own isolated in-memory registry."""
-    monkeypatch.setattr(
-        "app.api.chat.knowledge_registry",
-        registry,
+    """Inject a test-only retriever without connecting to PostgreSQL."""
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_knowledge_retriever,
+        lambda: RegistryTestRetriever(registry),
     )
 
 
@@ -115,7 +157,6 @@ def test_chat_returns_matching_approved_english_content(monkeypatch):
 
 def test_chat_returns_matching_approved_kiswahili_content(monkeypatch):
     registry = make_registry()
-
     document = make_document(
         document_id="hiv-sw-001",
         language="sw",
@@ -134,6 +175,8 @@ def test_chat_returns_matching_approved_kiswahili_content(monkeypatch):
     assert data["language"] == "sw"
     assert "VVU ni virusi" in data["answer"]
     assert len(data["sources"]) == 1
+    assert data["sources"][0]["title"] == "Test health information"
+    assert data["sources"][0]["organization"] == "Test organization"
     assert "Huu si ushauri wa kitabibu" in data["safety_notice"]
 
 
@@ -230,7 +273,9 @@ def test_chat_excludes_documents_with_mismatched_source_language(
 
     assert response.status_code == 200
     data = response.json()
-    assert "CONTENT WITH MISMATCHED SOURCE LANGUAGE" not in data["answer"]
+    assert (
+        "CONTENT WITH MISMATCHED SOURCE LANGUAGE" not in data["answer"]
+    )
     assert data["sources"] == []
 
 
@@ -239,6 +284,7 @@ def test_chat_rejects_unsupported_language():
         "/api/v1/chat",
         json={"message": "Hello", "language": "fr"},
     )
+
     assert response.status_code == 422
 
 
@@ -247,6 +293,7 @@ def test_chat_rejects_blank_message():
         "/api/v1/chat",
         json={"message": "   ", "language": "en"},
     )
+
     assert response.status_code == 422
 
 
@@ -255,6 +302,7 @@ def test_chat_rejects_missing_language():
         "/api/v1/chat",
         json={"message": "Hello"},
     )
+
     assert response.status_code == 422
 
 
@@ -342,3 +390,47 @@ def test_chat_never_returns_modified_content_without_new_approval(
     assert "SECRET MODIFIED HIV INFORMATION FOR TESTING." not in data["answer"]
     assert data["sources"] == []
     assert "no approved health information" in data["answer"]
+
+
+def test_chat_returns_503_when_database_configuration_is_missing(
+    monkeypatch,
+):
+    from app.db import session as db_session
+
+    app.dependency_overrides.pop(get_knowledge_retriever, None)
+    monkeypatch.setattr(db_session, "SessionLocal", None)
+
+    response = client.post(
+        "/api/v1/chat",
+        json={"message": "What is HIV?", "language": "en"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "The health information service is temporarily "
+        "unavailable. Please try again later."
+    )
+
+
+def test_chat_returns_503_when_database_query_fails(monkeypatch):
+    class FailingRetriever:
+        def retrieve(self, query, language, limit=5):
+            raise SQLAlchemyError("synthetic database failure")
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_knowledge_retriever,
+        lambda: FailingRetriever(),
+    )
+
+    response = client.post(
+        "/api/v1/chat",
+        json={"message": "What is HIV?", "language": "en"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "The health information service is temporarily "
+        "unavailable. Please try again later."
+    )
+    assert "synthetic database failure" not in response.text

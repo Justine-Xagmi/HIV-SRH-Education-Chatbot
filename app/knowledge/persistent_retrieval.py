@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -52,6 +53,11 @@ class PersistentKnowledgeRetriever:
         "source_publication_date",
         "source_last_verified_at",
         "source_permission_status",
+        "source_permission_basis",
+        "source_permission_reference",
+        "source_permission_checked_at",
+        "source_permission_checked_by",
+        "source_permission_notes",
     }
 
     def __init__(self, db: Session) -> None:
@@ -67,6 +73,26 @@ class PersistentKnowledgeRetriever:
             re.findall(r"\w+", f"{title} {content}".lower())
         )
         return len(tokens & searchable)
+
+    @staticmethod
+    def _parse_aware_timestamp(value: object) -> datetime | None:
+        """Parse a timestamp and normalize it to UTC."""
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+
+        return parsed.astimezone(timezone.utc)
 
     def _latest_version(
         self, document_id: int
@@ -135,7 +161,8 @@ class PersistentKnowledgeRetriever:
         if len(version.content_fingerprint) != 64:
             return False
 
-        # Verify metadata that exists independently in the current database.
+
+
         if snapshot["title"] != document.title:
             return False
 
@@ -161,15 +188,37 @@ class PersistentKnowledgeRetriever:
         if snapshot["source_language"] != source.language:
             return False
 
-        if snapshot["source_permission_status"] != source.permission_status:
+        if (
+            snapshot["source_permission_status"]
+            != source.permission_status
+        ):
             return False
 
-        if snapshot["content_fingerprint"] != version.content_fingerprint:
+        reviewed_timestamp = self._parse_aware_timestamp(
+            snapshot["source_last_verified_at"]
+        )
+        current_timestamp = self._parse_aware_timestamp(
+            source.last_verified_at
+        )
+
+        if reviewed_timestamp is None or current_timestamp is None:
             return False
 
-        # Reconstruct the reviewed document and recalculate its fingerprint.
-        # Review status is set to approved only to reconstruct the reviewed
-        # snapshot; the actual decision was checked independently above.
+        if reviewed_timestamp != current_timestamp:
+            return False
+
+        if (
+            snapshot["content_fingerprint"]
+            != version.content_fingerprint
+        ):
+            return False
+
+        permission_checked_at = self._parse_aware_timestamp(
+            snapshot["source_permission_checked_at"]
+        )
+        if permission_checked_at is None:
+            return False
+
         try:
             reviewed_source = HealthSource(
                 source_id=snapshot["source_id"],
@@ -184,6 +233,15 @@ class PersistentKnowledgeRetriever:
                 publication_date=snapshot["source_publication_date"],
                 last_verified_at=snapshot["source_last_verified_at"],
                 permission_status=snapshot["source_permission_status"],
+                permission_basis=snapshot["source_permission_basis"],
+                permission_reference=snapshot[
+                    "source_permission_reference"
+                ],
+                permission_checked_at=permission_checked_at,
+                permission_checked_by=snapshot[
+                    "source_permission_checked_by"
+                ],
+                permission_notes=snapshot["source_permission_notes"],
             )
 
             reviewed_document = KnowledgeDocument(
@@ -204,9 +262,6 @@ class PersistentKnowledgeRetriever:
         calculated_fingerprint = document_fingerprint(reviewed_document)
 
         if calculated_fingerprint != version.content_fingerprint:
-            return False
-
-        if snapshot["document_id"] == "":
             return False
 
         if snapshot["source_id"] == "":

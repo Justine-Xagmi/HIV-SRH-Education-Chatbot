@@ -11,6 +11,7 @@ from app.db.models import (
     HealthSource,
     KnowledgeAuditEvent,
     KnowledgeDocument,
+    KnowledgeDocumentTopic,
 )
 
 
@@ -77,6 +78,144 @@ class KnowledgeRepository:
     def get_document(self, document_id: int) -> KnowledgeDocument | None:
         return self.db.get(KnowledgeDocument, document_id)
 
+    def add_document_topic(
+        self,
+        *,
+        document_id: int,
+        topic: str,
+    ) -> KnowledgeDocumentTopic:
+        """Assign one topic to an existing knowledge document."""
+
+        if self.get_document(document_id) is None:
+            raise ValueError(
+                f"Knowledge document {document_id} does not exist."
+            )
+
+        normalized_topic = topic.strip()
+
+        if not normalized_topic:
+            raise ValueError("Topic cannot be empty.")
+
+        if len(normalized_topic) > 100:
+            raise ValueError("Topic cannot exceed 100 characters.")
+
+        existing_topics = self.list_document_topics(document_id)
+
+        if normalized_topic in existing_topics:
+            raise ValueError(
+                f"Topic '{normalized_topic}' is already assigned."
+            )
+
+        document_topic = KnowledgeDocumentTopic(
+            document_id=document_id,
+            topic=normalized_topic,
+        )
+
+        self.db.add(document_topic)
+        self.db.flush()
+
+        return document_topic
+
+    def add_document_topics(
+        self,
+        *,
+        document_id: int,
+        topics: list[str],
+    ) -> list[KnowledgeDocumentTopic]:
+        """Assign multiple distinct topics to a document."""
+
+        if self.get_document(document_id) is None:
+            raise ValueError(
+                f"Knowledge document {document_id} does not exist."
+            )
+
+        normalized_topics = [topic.strip() for topic in topics]
+
+        if not normalized_topics:
+            raise ValueError("At least one topic is required.")
+
+        if any(not topic for topic in normalized_topics):
+            raise ValueError("Topics cannot contain empty values.")
+
+        if any(len(topic) > 100 for topic in normalized_topics):
+            raise ValueError("Topics cannot exceed 100 characters.")
+
+        if len(normalized_topics) != len(set(normalized_topics)):
+            raise ValueError("Duplicate topics are not allowed.")
+
+        existing_topics = set(self.list_document_topics(document_id))
+
+        if existing_topics.intersection(normalized_topics):
+            raise ValueError("One or more topics are already assigned.")
+
+        records = [
+            KnowledgeDocumentTopic(
+                document_id=document_id,
+                topic=topic,
+            )
+            for topic in normalized_topics
+        ]
+
+        self.db.add_all(records)
+        self.db.flush()
+
+        return records
+
+    def list_document_topics(self, document_id: int) -> list[str]:
+        """Return all topics assigned to a document."""
+
+        statement = (
+            select(KnowledgeDocumentTopic.topic)
+            .where(KnowledgeDocumentTopic.document_id == document_id)
+            .order_by(KnowledgeDocumentTopic.topic)
+        )
+
+        return list(self.db.scalars(statement).all())
+
+    def replace_document_topics(
+        self,
+        *,
+        document_id: int,
+        topics: list[str],
+    ) -> list[KnowledgeDocumentTopic]:
+        """Replace topic assignments within the caller's transaction."""
+
+        if self.get_document(document_id) is None:
+            raise ValueError(
+                f"Knowledge document {document_id} does not exist."
+            )
+
+        normalized_topics = [topic.strip() for topic in topics]
+
+        if not normalized_topics:
+            raise ValueError("At least one topic is required.")
+
+        if any(not topic for topic in normalized_topics):
+            raise ValueError("Topics cannot contain empty values.")
+
+        if any(len(topic) > 100 for topic in normalized_topics):
+            raise ValueError("Topics cannot exceed 100 characters.")
+
+        if len(normalized_topics) != len(set(normalized_topics)):
+            raise ValueError("Duplicate topics are not allowed.")
+
+        self.db.query(KnowledgeDocumentTopic).filter_by(
+            document_id=document_id
+        ).delete(synchronize_session=False)
+
+        records = [
+            KnowledgeDocumentTopic(
+                document_id=document_id,
+                topic=topic,
+            )
+            for topic in normalized_topics
+        ]
+
+        self.db.add_all(records)
+        self.db.flush()
+
+        return records
+
     def create_document_version(
         self,
         *,
@@ -86,13 +225,17 @@ class KnowledgeRepository:
         content_fingerprint: str,
     ) -> DocumentVersion:
         if self.get_document(document_id) is None:
-            raise ValueError(f"Knowledge document {document_id} does not exist.")
+            raise ValueError(
+                f"Knowledge document {document_id} does not exist."
+            )
 
         if version_number < 1:
             raise ValueError("Version number must be at least 1.")
 
         if len(content_fingerprint) != 64:
-            raise ValueError("Content fingerprint must contain 64 characters.")
+            raise ValueError(
+                "Content fingerprint must contain 64 characters."
+            )
 
         version = DocumentVersion(
             document_id=document_id,
@@ -105,12 +248,14 @@ class KnowledgeRepository:
         return version
 
     def get_document_version(
-        self, version_id: int
+        self,
+        version_id: int,
     ) -> DocumentVersion | None:
         return self.db.get(DocumentVersion, version_id)
 
     def list_document_versions(
-        self, document_id: int
+        self,
+        document_id: int,
     ) -> list[DocumentVersion]:
         statement = (
             select(DocumentVersion)
@@ -133,7 +278,12 @@ class KnowledgeRepository:
                 f"Document version {document_version_id} does not exist."
             )
 
-        allowed_decisions = {"approved", "rejected", "changes_requested"}
+        allowed_decisions = {
+            "approved",
+            "rejected",
+            "changes_requested",
+        }
+
         if decision not in allowed_decisions:
             raise ValueError("Invalid clinical review decision.")
 
@@ -155,7 +305,8 @@ class KnowledgeRepository:
         return review
 
     def list_reviews_for_version(
-        self, version_id: int
+        self,
+        version_id: int,
     ) -> list[ClinicalReviewRecord]:
         statement = (
             select(ClinicalReviewRecord)

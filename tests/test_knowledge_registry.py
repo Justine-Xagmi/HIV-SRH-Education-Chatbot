@@ -30,7 +30,11 @@ def make_document(
         url="https://example.org/health-information",
         language=actual_source_language,
         review_status=source_review_status,
-        reviewed_by="test-reviewer" if source_review_status == "approved" else None,
+        reviewed_by=(
+            "test-reviewer"
+            if source_review_status == "approved"
+            else None
+        ),
         reviewed_at=(
             datetime.now(timezone.utc)
             if source_review_status == "approved"
@@ -38,8 +42,21 @@ def make_document(
         ),
         version="1.0",
         publication_date=date(2025, 1, 1),
-        last_verified_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        last_verified_at=datetime(
+            2026, 10, 1, tzinfo=timezone.utc
+        ),
         permission_status="permitted",
+        permission_basis=(
+            "Synthetic permission evidence for automated testing."
+        ),
+        permission_reference="TEST-PERMISSION-001",
+        permission_checked_at=datetime(
+            2026, 10, 1, tzinfo=timezone.utc
+        ),
+        permission_checked_by="test-permission-reviewer",
+        permission_notes=(
+            "Test fixture only; not evidence of real-world permission."
+        ),
     )
 
     return KnowledgeDocument(
@@ -49,7 +66,9 @@ def make_document(
         content=content,
         language=language,
         review_status=review_status,
-        reviewed_by="test-reviewer" if review_status == "approved" else None,
+        reviewed_by=(
+            "test-reviewer" if review_status == "approved" else None
+        ),
         reviewed_at=(
             datetime.now(timezone.utc)
             if review_status == "approved"
@@ -337,7 +356,6 @@ def test_review_history_preserves_multiple_decisions():
     assert len(records) == 2
     assert records[0].decision == "changes_requested"
     assert records[1].decision == "approved"
-
 
 
 def test_changed_source_permission_requires_fresh_approval():

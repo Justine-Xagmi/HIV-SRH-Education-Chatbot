@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0f766e">
+    <meta name="description" content="HIV and sexual and reproductive health education chatbot.">
+    <title>AfyaChat | HIV & SRH Education</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-shell">
+        <header class="topbar">
+            <a class="brand" href="/">
+                <span class="brand-icon">✚</span>
+                <span>
+                    <strong>AfyaChat</strong>
+                    <small>HIV & SRH Education</small>
+                </span>
+            </a>
+
+            <label class="language-control">
+                <span class="sr-only">Choose language</span>
+                <select id="languageSelect" aria-label="Choose language">
+                    <option value="en">English</option>
+                    <option value="sw">Kiswahili</option>
+                </select>
+            </label>
+        </header>
+
+        <main class="chat-layout">
+            <section class="intro">
+                <div class="intro-icon">♡</div>
+                <p class="eyebrow" id="eyebrow">YOUR HEALTH. YOUR KNOWLEDGE.</p>
+                <h1 id="welcomeTitle">Hello! How can I help you today?</h1>
+                <p class="intro-text" id="welcomeText">
+                    Ask questions about HIV, sexual health and reproductive health.
+                    Get educational information in your preferred language.
+                </p>
+            </section>
+
+            <section class="chat-card" aria-label="Chat conversation">
+                <div class="chat-heading">
+                    <div>
+                        <strong id="assistantName">AfyaChat Assistant</strong>
+                        <span class="online-status" id="statusText">Educational support</span>
+                    </div>
+                    <button type="button" class="clear-button" id="clearButton">
+                        Clear chat
+                    </button>
+                </div>
+
+                <div id="chatMessages" class="messages" aria-live="polite">
+                    <div class="message assistant-message">
+                        <div class="avatar">✚</div>
+                        <div class="message-content">
+                            <div class="message-bubble" id="initialMessage">
+                                Welcome! You can ask me a health education question.
+                                Please do not share private identifying information.
+                            </div>
+                            <span class="message-time">AfyaChat</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="composer">
+                    <label class="sr-only" for="messageInput">Your message</label>
+                    <textarea
+                        id="messageInput"
+                        rows="1"
+                        maxlength="2000"
+                        placeholder="Type your health question..."
+                    ></textarea>
+                    <button type="button" id="sendButton" class="send-button">
+                        <span id="sendLabel">Send</span>
+                        <span aria-hidden="true">➤</span>
+                    </button>
+                </div>
+                <p class="input-hint" id="inputHint">
+                    Press Enter to send · Shift + Enter for a new line · Maximum 2,000 characters
+                </p>
+            </section>
+
+            <div class="safety-note">
+                <span aria-hidden="true">ⓘ</span>
+                <p id="safetyText">
+                    This chatbot provides general educational information, not medical
+                    diagnosis or treatment. For personal medical advice, consult a
+                    qualified healthcare professional.
+                </p>
+            </div>
+        </main>
+
+        <footer>
+            <span>AfyaChat</span>
+            <span id="footerText">Supporting informed health decisions through education.</span>
+        </footer>
+    </div>
+
+    <script src="/static/app.js" defer></script>
+</body>
+</html>

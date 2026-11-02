@@ -20,8 +20,33 @@ from app.knowledge.review_workflow import document_fingerprint
 ReviewDecision = Literal["approved", "rejected", "changes_requested"]
 
 
+def _parse_aware_timestamp(value: object) -> datetime | None:
+    """Parse a datetime or ISO-8601 string and normalize it to UTC."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+
+    return parsed.astimezone(timezone.utc)
+
+
+def _canonical_timestamp(value: object) -> str | None:
+    """Return a normalized UTC ISO-8601 timestamp."""
+    parsed = _parse_aware_timestamp(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
 def build_review_snapshot(document: KnowledgeDocument) -> dict:
-    """Capture the document and source metadata used for a review."""
+    """Capture document and complete source metadata used for review."""
+    source = document.source
 
     return {
         "document_id": document.document_id,
@@ -29,32 +54,38 @@ def build_review_snapshot(document: KnowledgeDocument) -> dict:
         "content_fingerprint": document_fingerprint(document),
         "language": document.language,
         "topics": sorted(document.topics),
-        "source_id": document.source.source_id,
-        "source_title": document.source.title,
-        "source_organization": document.source.organization,
-        "source_url": str(document.source.url),
-        "source_language": document.source.language,
-        "source_version": document.source.version,
+        "source_id": source.source_id,
+        "source_title": source.title,
+        "source_organization": source.organization,
+        "source_url": str(source.url),
+        "source_language": source.language,
+        "source_version": source.version,
         "source_publication_date": (
-            document.source.publication_date.isoformat()
-            if document.source.publication_date
+            source.publication_date.isoformat()
+            if source.publication_date
             else None
         ),
-        "source_last_verified_at": (
-            document.source.last_verified_at.isoformat()
-            if document.source.last_verified_at
-            else None
+        "source_last_verified_at": _canonical_timestamp(
+            source.last_verified_at
         ),
-        "source_permission_status": document.source.permission_status,
+        "source_permission_status": source.permission_status,
+        "source_permission_basis": source.permission_basis,
+        "source_permission_reference": source.permission_reference,
+        "source_permission_checked_at": _canonical_timestamp(
+            source.permission_checked_at
+        ),
+        "source_permission_checked_by": source.permission_checked_by,
+        "source_permission_notes": source.permission_notes,
     }
 
 
 class PersistentClinicalReviewWorkflow:
     """
-    Database-backed review workflow.
+    Database-backed clinical review workflow.
 
-    This service enforces configured reviewer IDs and persists review evidence.
-    It does not authenticate users or verify clinical qualifications.
+    This service enforces configured reviewer IDs and persists review
+    evidence. It does not authenticate users or verify clinical
+    qualifications.
 
     The caller owns the outer database transaction and must commit or roll
     it back. Review and audit writes are grouped in a database savepoint.
@@ -110,25 +141,67 @@ class PersistentClinicalReviewWorkflow:
         if version_number < 1:
             raise ValueError("Version number must be at least 1.")
 
-        fingerprint = document_fingerprint(document)
-        snapshot = build_review_snapshot(document)
-
         db_document = self.db.get(DBDocument, database_document_id)
         if db_document is None:
             raise ValueError("Database document does not exist.")
 
         if db_document.language != document.language:
             raise ValueError(
-                "Database document language does not match the submitted document."
+                "Database document language does not match "
+                "the submitted document."
             )
 
         source = self.db.get(DBHealthSource, db_document.source_id)
         if source is None:
             raise ValueError("Database source does not exist.")
 
+        if document.source.title != source.name:
+            raise ValueError(
+                "Submitted source title does not match the database source."
+            )
+
+        if document.source.organization != source.organization:
+            raise ValueError(
+                "Submitted source organization does not match "
+                "the database source."
+            )
+
+        if str(document.source.url) != source.source_url:
+            raise ValueError(
+                "Submitted source URL does not match the database source."
+            )
+
+        if document.source.language != source.language:
+            raise ValueError(
+                "Submitted source language does not match "
+                "the database source."
+            )
+
         if not source.is_active:
             raise ValueError(
                 "Inactive sources cannot be reviewed for approval."
+            )
+
+        submitted_verified_at = _parse_aware_timestamp(
+            document.source.last_verified_at
+        )
+        database_verified_at = _parse_aware_timestamp(
+            source.last_verified_at
+        )
+
+        if (
+            submitted_verified_at is None
+            or database_verified_at is None
+        ):
+            raise ValueError(
+                "A valid timezone-aware source verification timestamp "
+                "is required."
+            )
+
+        if submitted_verified_at != database_verified_at:
+            raise ValueError(
+                "Source verification metadata has changed. "
+                "Refresh the document metadata before reviewing it."
             )
 
         if (
@@ -140,8 +213,11 @@ class PersistentClinicalReviewWorkflow:
                 "status is not 'permitted'."
             )
 
-        # Keep the immutable version, review, and audit writes in one savepoint.
-        # The caller remains responsible for committing or rolling back.
+        # The HealthSource model validates the permission evidence.
+        # Preserve that evidence in the immutable version snapshot.
+        fingerprint = document_fingerprint(document)
+        snapshot = build_review_snapshot(document)
+
         with self.db.begin_nested():
             existing_version = self.db.scalar(
                 select(DocumentVersion).where(
@@ -169,7 +245,8 @@ class PersistentClinicalReviewWorkflow:
                 if existing_version.review_snapshot != snapshot:
                     raise ValueError(
                         "The existing review snapshot differs from the "
-                        "submitted document metadata. Create a new version number."
+                        "submitted document metadata. Create a new version "
+                        "number."
                     )
 
                 db_version = existing_version

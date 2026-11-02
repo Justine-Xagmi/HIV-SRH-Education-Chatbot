@@ -1,3 +1,4 @@
+﻿
 import json
 import uuid
 from datetime import date, datetime, timezone
@@ -18,6 +19,7 @@ from app.knowledge.persistent_review_workflow import (
     PersistentClinicalReviewWorkflow,
     build_review_snapshot,
 )
+from app.knowledge.persistent_retrieval import PersistentKnowledgeRetriever
 
 
 IMMUTABILITY_TRIGGER = "trg_document_versions_immutable"
@@ -34,19 +36,33 @@ def drop_immutability_trigger(db):
 
 
 def restore_immutability_trigger(db):
-    """Ensure the normal document-version immutability trigger exists."""
-    # Avoid CREATE TRIGGER failing when the trigger already exists.
-    drop_immutability_trigger(db)
-    db.execute(
+    """Create the immutability trigger only when it is missing."""
+    trigger_exists = db.execute(
         text(
-            f"""
-            CREATE TRIGGER {IMMUTABILITY_TRIGGER}
-            BEFORE UPDATE OR DELETE ON document_versions
-            FOR EACH ROW
-            EXECUTE FUNCTION prevent_document_version_mutation()
             """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_trigger
+                WHERE tgname = :trigger_name
+                  AND tgrelid = to_regclass('public.document_versions')
+                  AND NOT tgisinternal
+            )
+            """
+        ),
+        {"trigger_name": IMMUTABILITY_TRIGGER},
+    ).scalar_one()
+
+    if not trigger_exists:
+        db.execute(
+            text(
+                f"""
+                CREATE TRIGGER {IMMUTABILITY_TRIGGER}
+                BEFORE UPDATE OR DELETE ON document_versions
+                FOR EACH ROW
+                EXECUTE FUNCTION prevent_document_version_mutation()
+                """
+            )
         )
-    )
 
 
 @pytest.fixture
@@ -60,6 +76,7 @@ def review_test_context():
 
     source_name = f"Test source {suffix}"
     document_title = f"Test document {suffix}"
+    verified_at = datetime.now(timezone.utc)
 
     try:
         db_source = DBSource(
@@ -70,7 +87,7 @@ def review_test_context():
             language="en",
             permission_status="permitted",
             is_active=True,
-            last_verified_at=datetime.now(timezone.utc),
+            last_verified_at=verified_at,
         )
         db.add(db_source)
         db.flush()
@@ -96,8 +113,17 @@ def review_test_context():
             reviewed_at=None,
             version="1.0",
             publication_date=date(2025, 1, 1),
-            last_verified_at=datetime.now(timezone.utc),
+            last_verified_at=verified_at,
             permission_status="permitted",
+            permission_basis=(
+                "Synthetic permission evidence for automated testing."
+            ),
+            permission_reference="TEST-PERMISSION-001",
+            permission_checked_at=verified_at,
+            permission_checked_by="persistent-review-test-reviewer",
+            permission_notes=(
+                "Test fixture only; not evidence of real-world permission."
+            ),
         )
 
         document = KnowledgeDocument(
@@ -143,12 +169,12 @@ def review_test_context():
                       AND entity_id = :document_id
                     """
                 ),
-                {"document_id": str(locals().get("db_document").id)}
-                if locals().get("db_document") is not None
+                {"document_id": str(db_document.id)}
+                if "db_document" in locals()
                 else {"document_id": "-1"},
             )
 
-            if locals().get("db_document") is not None:
+            if "db_document" in locals():
                 version_ids = list(
                     db.scalars(
                         select(DocumentVersion.id).where(
@@ -178,23 +204,26 @@ def review_test_context():
 
                 db.execute(
                     text(
-                        "DELETE FROM knowledge_documents WHERE id = :document_id"
+                        "DELETE FROM knowledge_documents "
+                        "WHERE id = :document_id"
                     ),
                     {"document_id": db_document.id},
                 )
 
-            if locals().get("db_source") is not None:
+            if "db_source" in locals():
                 db.execute(
                     text("DELETE FROM health_sources WHERE id = :source_id"),
                     {"source_id": db_source.id},
                 )
 
+            # Restore the trigger in the same transaction as cleanup.
             restore_immutability_trigger(db)
             db.commit()
 
         except Exception:
             db.rollback()
             raise
+
         finally:
             db.close()
 
@@ -300,7 +329,6 @@ def test_unauthorized_reviewer_is_rejected(review_test_context):
 def test_preparer_cannot_review_own_submission(review_test_context):
     context = review_test_context
 
-    # Authorize the reviewer so the self-review safeguard is reached.
     workflow = make_workflow(
         context,
         authorized={"reviewer-test", "preparer-test"},
@@ -401,8 +429,7 @@ def test_existing_version_rejects_changed_review_snapshot_metadata(
     assert version is not None
     assert version.review_snapshot is not None
 
-    # This test deliberately simulates an inconsistent legacy database
-    # state. Use a savepoint so the altered snapshot is rolled back.
+    # Simulate an inconsistent legacy database state for this test.
     savepoint = db.begin_nested()
 
     try:
@@ -422,7 +449,7 @@ def test_existing_version_rejects_changed_review_snapshot_metadata(
 
         db.expire_all()
 
-        # Restore the normal trigger after rolling back the simulated state.
+        # The savepoint rollback may already have restored the trigger.
         restore_immutability_trigger(db)
         db.commit()
 
@@ -443,15 +470,18 @@ def test_legacy_version_without_snapshot_is_rejected(review_test_context):
     )
     assert version is not None
 
-    # Simulate a legacy version without a snapshot. This mutation is
-    # test-only; the immutability trigger is restored immediately after.
     try:
         drop_immutability_trigger(db)
         version.review_snapshot = None
-        db.commit()
-    finally:
+        db.flush()
+
+        # Restore the trigger before committing the test mutation.
         restore_immutability_trigger(db)
         db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
 
     with pytest.raises(ValueError, match="no review snapshot"):
         call_review(context, workflow)
@@ -465,8 +495,6 @@ def test_outer_transaction_rollback_removes_review_and_audit(
     workflow = make_workflow(context)
 
     call_review(context, workflow)
-
-    # The workflow must not commit the caller's outer transaction.
     db.rollback()
 
     version = db.scalar(
@@ -514,9 +542,6 @@ def test_build_review_snapshot_contains_source_metadata(
     )
 
 
-from app.knowledge.persistent_retrieval import PersistentKnowledgeRetriever
-
-
 def test_retriever_returns_currently_approved_document(review_test_context):
     context = review_test_context
     db = context["db"]
@@ -544,7 +569,6 @@ def test_retriever_excludes_document_when_latest_version_is_rejected(
     call_review(context, workflow)
     db.commit()
 
-    # Create a newer version with synthetic content and reject it.
     changed_document = context["document"].model_copy(
         update={
             "content": (
@@ -582,16 +606,6 @@ def test_retriever_excludes_document_without_review_snapshot(
     call_review(context, workflow)
     db.commit()
 
-    version = db.scalar(
-        select(DocumentVersion).where(
-            DocumentVersion.document_id == context["document_id"],
-            DocumentVersion.version_number == 1,
-        )
-    )
-    assert version is not None
-
-    # Create a newer legacy-style version without a review snapshot or review.
-    # The database permits inserts; existing versions remain immutable.
     db.add(
         DocumentVersion(
             document_id=context["document_id"],
@@ -612,7 +626,6 @@ def test_retriever_excludes_document_without_review_snapshot(
     assert results == []
 
 
-
 def test_retriever_excludes_document_when_source_metadata_changes(
     review_test_context,
 ):
@@ -626,7 +639,6 @@ def test_retriever_excludes_document_when_source_metadata_changes(
     source = db.get(DBSource, context["source_id"])
     assert source is not None
 
-    # Simulate a source metadata change after review.
     source.organization = "Unexpected Synthetic Organization"
     db.commit()
 
@@ -635,6 +647,28 @@ def test_retriever_excludes_document_when_source_metadata_changes(
 
     assert results == []
 
+
+def test_retriever_excludes_document_when_source_verification_timestamp_changes(
+    review_test_context,
+):
+    context = review_test_context
+    db = context["db"]
+
+    workflow = make_workflow(context)
+    call_review(context, workflow)
+    db.commit()
+
+    source = db.get(DBSource, context["source_id"])
+    assert source is not None
+
+    # Simulate a source verification timestamp change after approval.
+    source.last_verified_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    db.commit()
+
+    retriever = PersistentKnowledgeRetriever(db)
+    results = retriever.retrieve("synthetic test content", "en")
+
+    assert results == []
 
 
 def test_retriever_respects_requested_language(review_test_context):
@@ -692,8 +726,6 @@ def test_retriever_respects_result_limit(review_test_context):
     call_review(context, workflow)
     db.commit()
 
-    # The fixture supplies one approved document. A limit of one should
-    # return that document, while a limit of zero should return no results.
     retriever = PersistentKnowledgeRetriever(db)
 
     one_result = retriever.retrieve(
@@ -709,3 +741,427 @@ def test_retriever_respects_result_limit(review_test_context):
 
     assert len(one_result) == 1
     assert no_results == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "source_title",
+        "source_organization",
+        "source_url",
+    ],
+)
+def test_retriever_excludes_document_when_required_snapshot_field_is_missing(
+    review_test_context, field
+):
+    context = review_test_context
+    db = context["db"]
+
+    workflow = make_workflow(context)
+    call_review(context, workflow)
+    db.commit()
+
+    version = db.scalar(
+        select(DocumentVersion).where(
+            DocumentVersion.document_id == context["document_id"],
+            DocumentVersion.version_number == 1,
+        )
+    )
+    assert version is not None
+    assert isinstance(version.review_snapshot, dict)
+
+    try:
+        drop_immutability_trigger(db)
+
+        altered_snapshot = dict(version.review_snapshot)
+        altered_snapshot.pop(field)
+        version.review_snapshot = altered_snapshot
+        db.flush()
+
+        restore_immutability_trigger(db)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+    assert results == []
+
+
+def test_retriever_excludes_document_with_non_dictionary_snapshot(
+    review_test_context,
+):
+    context = review_test_context
+    db = context["db"]
+
+    workflow = make_workflow(context)
+    call_review(context, workflow)
+    db.commit()
+
+    version = db.scalar(
+        select(DocumentVersion).where(
+            DocumentVersion.document_id == context["document_id"],
+            DocumentVersion.version_number == 1,
+        )
+    )
+    assert version is not None
+
+    try:
+        drop_immutability_trigger(db)
+        version.review_snapshot = ["malformed", "snapshot"]
+        db.flush()
+
+        restore_immutability_trigger(db)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("document_id", ""),
+        ("source_id", ""),
+        ("document_id", "different-document-id"),
+        ("source_id", "different-source-id"),
+    ],
+)
+def test_retriever_excludes_document_with_invalid_snapshot_identifiers(
+    review_test_context, field, value
+):
+    context = review_test_context
+    db = context["db"]
+
+    workflow = make_workflow(context)
+    call_review(context, workflow)
+    db.commit()
+
+    version = db.scalar(
+        select(DocumentVersion).where(
+            DocumentVersion.document_id == context["document_id"],
+            DocumentVersion.version_number == 1,
+        )
+    )
+    assert version is not None
+    assert isinstance(version.review_snapshot, dict)
+
+    try:
+        drop_immutability_trigger(db)
+
+        altered_snapshot = dict(version.review_snapshot)
+        altered_snapshot[field] = value
+        version.review_snapshot = altered_snapshot
+        db.flush()
+
+        restore_immutability_trigger(db)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    "timestamp_value",
+    [
+        None,
+        "not-a-valid-timestamp",
+        "2025-01-01T12:00:00",
+    ],
+)
+def test_retriever_excludes_document_with_invalid_snapshot_timestamp(
+    review_test_context, timestamp_value
+):
+    context = review_test_context
+    db = context["db"]
+
+    workflow = make_workflow(context)
+    call_review(context, workflow)
+    db.commit()
+
+    version = db.scalar(
+        select(DocumentVersion).where(
+            DocumentVersion.document_id == context["document_id"],
+            DocumentVersion.version_number == 1,
+        )
+    )
+    assert version is not None
+    assert isinstance(version.review_snapshot, dict)
+
+    try:
+        drop_immutability_trigger(db)
+
+        altered_snapshot = dict(version.review_snapshot)
+        altered_snapshot["source_last_verified_at"] = timestamp_value
+        version.review_snapshot = altered_snapshot
+        db.flush()
+
+        restore_immutability_trigger(db)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+    assert results == []
+
+
+def test_retriever_excludes_document_when_stored_review_language_changes(
+    review_test_context,
+):
+    context = review_test_context
+    db = context["db"]
+
+    workflow = make_workflow(context)
+    review = call_review(context, workflow)
+    db.commit()
+
+    stored_review = db.get(DBReview, review.id)
+    assert stored_review is not None
+
+    stored_review.language = "sw"
+    db.commit()
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    "latest_decision",
+    ["rejected", "changes_requested"],
+)
+def test_latest_non_approval_on_same_version_blocks_retrieval(
+    review_test_context,
+    latest_decision,
+):
+    context = review_test_context
+    db = context["db"]
+    workflow = make_workflow(context)
+
+    first_review = call_review(context, workflow, decision="approved")
+    db.commit()
+
+    second_review = call_review(
+        context,
+        workflow,
+        decision=latest_decision,
+        rationale=f"Synthetic follow-up decision: {latest_decision}.",
+    )
+    db.commit()
+
+    assert first_review.document_version_id == second_review.document_version_id
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+
+    assert results == []
+
+
+def test_latest_approval_on_same_version_restores_retrieval(
+    review_test_context,
+):
+    context = review_test_context
+    db = context["db"]
+    workflow = make_workflow(context)
+
+    first_review = call_review(context, workflow, decision="rejected")
+    db.commit()
+
+    second_review = call_review(
+        context,
+        workflow,
+        decision="approved",
+        rationale="Synthetic follow-up approval for testing.",
+    )
+    db.commit()
+
+    assert first_review.document_version_id == second_review.document_version_id
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+
+    assert len(results) == 1
+    assert results[0].version_number == 1
+    assert results[0].content == context["document"].content
+
+
+def test_multiple_reviews_preserve_complete_history_for_same_version(
+    review_test_context,
+):
+    context = review_test_context
+    db = context["db"]
+    workflow = make_workflow(context)
+
+    first_review = call_review(
+        context,
+        workflow,
+        decision="approved",
+        rationale="First synthetic review.",
+    )
+    db.commit()
+
+    second_review = call_review(
+        context,
+        workflow,
+        decision="changes_requested",
+        rationale="Second synthetic review.",
+    )
+    db.commit()
+
+    third_review = call_review(
+        context,
+        workflow,
+        decision="approved",
+        rationale="Third synthetic review.",
+    )
+    db.commit()
+
+    assert (
+        first_review.document_version_id
+        == second_review.document_version_id
+        == third_review.document_version_id
+    )
+
+    stored_reviews = db.scalars(
+        select(DBReview)
+        .where(
+            DBReview.document_version_id
+            == first_review.document_version_id
+        )
+        .order_by(DBReview.id.asc())
+    ).all()
+
+    assert len(stored_reviews) == 3
+    assert [review.decision for review in stored_reviews] == [
+        "approved",
+        "changes_requested",
+        "approved",
+    ]
+    assert [review.rationale for review in stored_reviews] == [
+        "First synthetic review.",
+        "Second synthetic review.",
+        "Third synthetic review.",
+    ]
+    assert all(
+        review.reviewer_id == "reviewer-test"
+        for review in stored_reviews
+    )
+    assert all(
+        review.language == "en"
+        for review in stored_reviews
+    )
+
+    db_document = db.get(DBDocument, context["document_id"])
+    assert db_document is not None
+    assert db_document.status == "approved"
+
+
+def test_equal_review_timestamps_use_highest_review_id_as_tiebreaker(
+    review_test_context,
+):
+    context = review_test_context
+    db = context["db"]
+    workflow = make_workflow(context)
+
+    first_review = call_review(
+        context,
+        workflow,
+        decision="approved",
+    )
+    second_review = call_review(
+        context,
+        workflow,
+        decision="rejected",
+    )
+
+    same_timestamp = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+    first_review.reviewed_at = same_timestamp
+    second_review.reviewed_at = same_timestamp
+    db.commit()
+
+    assert first_review.id < second_review.id
+    assert (
+        first_review.document_version_id
+        == second_review.document_version_id
+    )
+
+    latest_review = PersistentKnowledgeRetriever(db)._latest_review(
+        first_review.document_version_id
+    )
+
+    assert latest_review is not None
+    assert latest_review.id == second_review.id
+    assert latest_review.decision == "rejected"
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    ("latest_decision", "document_status"),
+    [
+        ("approved", "pending_review"),
+        ("rejected", "approved"),
+        ("changes_requested", "approved"),
+    ],
+)
+def test_retriever_fails_closed_when_document_status_disagrees_with_latest_review(
+    review_test_context,
+    latest_decision,
+    document_status,
+):
+    context = review_test_context
+    db = context["db"]
+    workflow = make_workflow(context)
+
+    review = call_review(
+        context,
+        workflow,
+        decision=latest_decision,
+    )
+    db.commit()
+
+    db_document = db.get(DBDocument, context["document_id"])
+    assert db_document is not None
+
+    # Simulate inconsistent persisted state.
+    db_document.status = document_status
+    db.commit()
+
+    latest_review = PersistentKnowledgeRetriever(db)._latest_review(
+        review.document_version_id
+    )
+
+    assert latest_review is not None
+    assert latest_review.decision == latest_decision
+
+    results = PersistentKnowledgeRetriever(db).retrieve(
+        "synthetic test content", "en"
+    )
+
+    assert results == []

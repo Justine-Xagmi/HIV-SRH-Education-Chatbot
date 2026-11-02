@@ -43,3 +43,11 @@ if APP_ENV not in {"development", "testing", "production"}:
     raise ValueError(
         "APP_ENV must be development, testing, or production."
     )
+
+AUTHORIZED_CLINICAL_REVIEWER_IDS = {
+    reviewer_id.strip()
+    for reviewer_id in os.getenv(
+        "AUTHORIZED_CLINICAL_REVIEWER_IDS", ""
+    ).split(",")
+    if reviewer_id.strip()
+}

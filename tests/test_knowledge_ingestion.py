@@ -1,5 +1,5 @@
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -31,6 +31,15 @@ def make_candidate(
         publication_date=publication_date,
         last_verified_at=last_verified_at,
         permission_status=permission_status,
+        permission_basis="Synthetic permission evidence for automated tests.",
+        permission_reference="TEST-PERMISSION-001",
+        permission_checked_at=datetime(
+            2026, 10, 1, tzinfo=timezone.utc
+        ),
+        permission_checked_by="test-permission-reviewer",
+        permission_notes=(
+            "Test fixture only; not evidence of real-world permission."
+        ),
     )
 
     return KnowledgeDocument(
@@ -49,6 +58,22 @@ def test_valid_candidate_passes_metadata_validation():
     assert validate_candidate_document(document) == []
 
 
+def test_http_source_url_is_rejected():
+    document = make_candidate()
+
+    http_source = HealthSource.model_validate(
+        {
+            **document.source.model_dump(),
+            "url": "http://example.org/health",
+        }
+    )
+    document = document.model_copy(update={"source": http_source})
+
+    issues = validate_candidate_document(document)
+
+    assert "Source URL must use HTTPS." in issues
+
+
 def test_missing_source_metadata_is_reported():
     document = make_candidate(
         publication_date=None,
@@ -59,6 +84,65 @@ def test_missing_source_metadata_is_reported():
 
     assert "Source publication date is required." in issues
     assert "Source verification timestamp is required." in issues
+
+
+def test_missing_verification_timestamp_blocks_ingestion():
+    document = make_candidate(last_verified_at=None)
+
+    issues = validate_candidate_document(document)
+
+    assert "Source verification timestamp is required." in issues
+
+    with pytest.raises(ValueError, match="failed validation"):
+        prepare_candidate_document(document)
+
+
+def test_timezone_naive_verification_timestamp_is_rejected():
+    document = make_candidate(
+        last_verified_at=datetime(2026, 10, 1)
+    )
+
+    issues = validate_candidate_document(document)
+
+    assert (
+        "Source verification timestamp must be timezone-aware "
+        "and cannot be in the future."
+    ) in issues
+
+    with pytest.raises(ValueError, match="failed validation"):
+        prepare_candidate_document(document)
+
+
+def test_future_verification_timestamp_is_rejected():
+    future_timestamp = datetime.now(timezone.utc) + timedelta(days=1)
+    document = make_candidate(last_verified_at=future_timestamp)
+
+    issues = validate_candidate_document(document)
+
+    assert (
+        "Source verification timestamp must be timezone-aware "
+        "and cannot be in the future."
+    ) in issues
+
+    with pytest.raises(ValueError, match="failed validation"):
+        prepare_candidate_document(document)
+
+
+def test_valid_past_utc_verification_timestamp_is_accepted():
+    past_timestamp = datetime.now(timezone.utc) - timedelta(days=30)
+    document = make_candidate(last_verified_at=past_timestamp)
+
+    assert validate_candidate_document(document) == []
+
+
+def test_valid_past_non_utc_verification_timestamp_is_accepted():
+    non_utc_timestamp = (
+        datetime.now(timezone.utc) - timedelta(days=30)
+    ).astimezone(timezone(timedelta(hours=3)))
+
+    document = make_candidate(last_verified_at=non_utc_timestamp)
+
+    assert validate_candidate_document(document) == []
 
 
 def test_unknown_permission_status_blocks_validation():
@@ -97,8 +181,6 @@ def test_document_and_source_languages_must_match():
 def test_candidate_requires_at_least_one_topic():
     document = make_candidate(topics=[])
 
-    # Explicitly set an empty list after construction because the helper
-    # uses a default topic list when topics is None.
     document = document.model_copy(update={"topics": []})
 
     issues = validate_candidate_document(document)
@@ -176,3 +258,62 @@ def test_preparation_preserves_valid_metadata():
     assert prepared.source.permission_status == "permitted"
     assert prepared.review_status == "pending_review"
     assert prepared.source.review_status == "pending_review"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_issue"),
+    [
+        ("title", "   ", "Document title cannot be blank."),
+        ("content", "   ", "Document content cannot be blank."),
+        ("document_id", "   ", "Document ID cannot be blank."),
+    ],
+)
+def test_blank_document_fields_are_rejected(
+    field,
+    value,
+    expected_issue,
+):
+    document = make_candidate().model_copy(
+        update={field: value}
+    )
+
+    issues = validate_candidate_document(document)
+
+    assert expected_issue in issues
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_issue"),
+    [
+        ("source_id", "   ", "Source ID cannot be blank."),
+        ("title", "   ", "Source title cannot be blank."),
+        ("organization", "   ", "Source organization cannot be blank."),
+        ("version", "   ", "Source version cannot be blank."),
+    ],
+)
+def test_blank_source_fields_are_rejected(
+    field,
+    value,
+    expected_issue,
+):
+    document = make_candidate()
+
+    source = document.source.model_copy(
+        update={field: value}
+    )
+
+    document = document.model_copy(update={"source": source})
+
+    issues = validate_candidate_document(document)
+
+    assert expected_issue in issues
+
+
+def test_duplicate_topics_are_rejected():
+    document = make_candidate(
+        topics=["hiv_prevention", "hiv_prevention"]
+    )
+
+    issues = validate_candidate_document(document)
+
+    assert "Duplicate knowledge topics are not allowed." in issues

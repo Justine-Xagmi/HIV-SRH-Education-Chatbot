@@ -133,3 +133,36 @@ class KnowledgeAuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )
+
+
+class KnowledgeDocumentTopic(Base):
+    """A topic assigned to a managed knowledge document."""
+
+    __tablename__ = "knowledge_document_topics"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "topic",
+            name="uq_knowledge_document_topics_document_topic",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("knowledge_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    topic: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
